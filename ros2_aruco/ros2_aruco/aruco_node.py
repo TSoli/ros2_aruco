@@ -27,18 +27,20 @@ Version: 10/26/2020
 
 """
 
+import cv2
+import numpy as np
 import rclpy
 import rclpy.node
-from rclpy.qos import qos_profile_sensor_data
-from cv_bridge import CvBridge
-import numpy as np
-import cv2
 import tf_transformations
-from sensor_msgs.msg import CameraInfo
-from sensor_msgs.msg import Image
-from geometry_msgs.msg import PoseArray, Pose
-from ros2_aruco_interfaces.msg import ArucoMarkers
+from cv_bridge import CvBridge
+from geometry_msgs.msg import Pose, PoseArray
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
+from rclpy.qos import qos_profile_sensor_data
+from ros2_aruco_interfaces.msg import ArucoMarkers
+from sensor_msgs.msg import CameraInfo, Image
+from tf2_ros import TransformException
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
 
 
 class ArucoNode(rclpy.node.Node):
@@ -149,6 +151,11 @@ class ArucoNode(rclpy.node.Node):
         self.aruco_parameters = cv2.aruco.DetectorParameters_create()
         self.bridge = CvBridge()
 
+        # Keep track of all the aruco tags
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self._all_tags = {}
+
     def info_callback(self, info_msg):
         self.info_msg = info_msg
         self.intrinsic_mat = np.reshape(np.array(self.info_msg.k), (3, 3))
@@ -164,12 +171,13 @@ class ArucoNode(rclpy.node.Node):
         cv_image = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding="mono8")
         markers = ArucoMarkers()
         pose_array = PoseArray()
+        pose_array.header.frame_id = "map"
         if self.camera_frame == "":
             markers.header.frame_id = self.info_msg.header.frame_id
-            pose_array.header.frame_id = self.info_msg.header.frame_id
+            # pose_array.header.frame_id = self.info_msg.header.frame_id
         else:
             markers.header.frame_id = self.camera_frame
-            pose_array.header.frame_id = self.camera_frame
+            # pose_array.header.frame_id = self.camera_frame
 
         markers.header.stamp = img_msg.header.stamp
         pose_array.header.stamp = img_msg.header.stamp
@@ -186,24 +194,44 @@ class ArucoNode(rclpy.node.Node):
                 rvecs, tvecs = cv2.aruco.estimatePoseSingleMarkers(
                     corners, self.marker_size, self.intrinsic_mat, self.distortion
                 )
+
+            from_frame_rel = markers.header.frame_id
+            to_frame_rel = "map"
+            try:
+                t = self.tf_buffer.lookup_transform(
+                    to_frame_rel, from_frame_rel, rclpy.time.Time()
+                )
+                translation = t.transform.translation
+                rotation = t.transform.rotation
+            except TransformException as ex:
+                self.get_logger().info(
+                    f"Could not transform {to_frame_rel} to {from_frame_rel} for aruco tag: {ex}"
+                )
+                return
+
             for i, marker_id in enumerate(marker_ids):
                 pose = Pose()
-                pose.position.x = tvecs[i][0][0]
-                pose.position.y = tvecs[i][0][1]
-                pose.position.z = tvecs[i][0][2]
+                pose.position.x = tvecs[i][0][0] + translation.x
+                pose.position.y = tvecs[i][0][1] + translation.y
+                pose.position.z = tvecs[i][0][2] + translation.z
 
                 rot_matrix = np.eye(4)
                 rot_matrix[0:3, 0:3] = cv2.Rodrigues(np.array(rvecs[i][0]))[0]
                 quat = tf_transformations.quaternion_from_matrix(rot_matrix)
 
-                pose.orientation.x = quat[0]
-                pose.orientation.y = quat[1]
-                pose.orientation.z = quat[2]
-                pose.orientation.w = quat[3]
+                pose.orientation.x = quat[0] + rotation.x
+                pose.orientation.y = quat[1] + rotation.y
+                pose.orientation.z = quat[2] + rotation.z
+                pose.orientation.w = quat[3] + rotation.w
 
-                pose_array.poses.append(pose)
+                # pose_array.poses.append(pose)
                 markers.poses.append(pose)
                 markers.marker_ids.append(marker_id[0])
+
+                self._all_tags[marker_id[0]] = pose
+
+            for _, pose in self._all_tags.items():
+                pose_array.poses.append(pose)
 
             self.poses_pub.publish(pose_array)
             self.markers_pub.publish(markers)
